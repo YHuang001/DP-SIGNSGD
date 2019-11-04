@@ -1,2 +1,2 @@
-# Noisy-SignSGD
-Simulation Codes for Noisy-SignSGD
+# DP-SIGNSGD
+Simulation Codes for DP-SIGNSGD
