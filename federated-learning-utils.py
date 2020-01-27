@@ -8,6 +8,7 @@ import math
 import random
 import heapq
 import math
+import time
 from sklearn.decomposition import PCA
 
 NODES = 31
@@ -65,13 +66,13 @@ def SameLabelSplitDataOverlap(nodes, images_by_label, labels_by_node, images_per
                 dataset_by_node[node][1] += labels
     return dataset_by_node
 
-def SameLabelSplitData(nodes, images_by_label, labels_by_node, same_num_images_per_node=False):
+def SameLabelSplitData(nodes, images_by_label, labels_by_node, number_of_imgs_by_node, same_num_images_per_node=False):
     dataset_by_node = defaultdict(list)
     segments = math.ceil(nodes*labels_by_node/10)
     num_of_images_by_label = [len(images_by_label[label]) for label in range(10)]
     if same_num_images_per_node:
         min_images_of_all_labels = min(num_of_images_by_label)
-        num_imgs_per_segment = int(min_images_of_all_labels/segments)
+        num_imgs_per_segment = min(int(min_images_of_all_labels/segments), number_of_imgs_by_node // labels_by_node)
     else:
         num_imgs_per_segment = [int(num_of_images/segments) for num_of_images in num_of_images_by_label]
     segment_ids = []
@@ -103,7 +104,7 @@ def SameLabelSplitData(nodes, images_by_label, labels_by_node, same_num_images_p
             heapq.heappush(segment_ids, used_label)
     return dataset_by_node
 
-def AssignDatasets(nodes, min_labels = 1, have_same_label_number=False, pre_process=False, same_num_images_per_node=False, sample_overlap_data=False):
+def AssignDatasets(nodes, min_labels = 1, number_of_imgs_by_node = 2000, have_same_label_number=False, pre_process=False, same_num_images_per_node=False, sample_overlap_data=False):
     mnist = keras.datasets.mnist
     (train_images, train_labels), (test_images, test_labels) = mnist.load_data()
     train_images, test_images = train_images/255.0, test_images/255.0
@@ -151,8 +152,8 @@ def AssignDatasets(nodes, min_labels = 1, have_same_label_number=False, pre_proc
             train_dataset_by_node = SameLabelSplitDataOverlap(nodes, train_images_by_label, min_labels)
             test_dataset_by_node = SameLabelSplitDataOverlap(nodes, test_images_by_label, min_labels)
         else:
-            train_dataset_by_node = SameLabelSplitData(nodes, train_images_by_label, min_labels, same_num_images_per_node=same_num_images_per_node)
-            test_dataset_by_node = SameLabelSplitData(nodes, test_images_by_label, min_labels, same_num_images_per_node=same_num_images_per_node)
+            train_dataset_by_node = SameLabelSplitData(nodes, train_images_by_label, min_labels, number_of_imgs_by_node=number_of_imgs_by_node, same_num_images_per_node=same_num_images_per_node)
+            test_dataset_by_node = SameLabelSplitData(nodes, test_images_by_label, min_labels, number_of_imgs_by_node=number_of_imgs_by_node, same_num_images_per_node=same_num_images_per_node)
     else:
         for label in range(min_labels):
             if label == 0:
@@ -280,6 +281,69 @@ def ClipGradsL2(grads, C):
     clipped_grads, _ = tf.clip_by_global_norm(grads, C)
     return clipped_grads
 
+def BatchedGrads(args):
+    inputs, targets = args
+    with tf.GradientTape() as tape:
+        inputs = tf.expand_dims(inputs, 0)
+        targets = tf.one_hot(targets, 10, dtype='float64')
+        predictions = MODEL(inputs)
+        loss = tf.keras.losses.categorical_crossentropy(y_true=targets, y_pred=predictions)
+
+    grads = tape.gradient(loss, MODEL.trainable_variables)
+    if CLIPPING:
+        if DELTA > 0:
+            return [grad / tf.maximum(tf.constant(1, dtype='float64'), tf.norm(grad)/C) for grad in grads]
+        elif DELTA == 0:
+            return [grad / tf.maximum(tf.constant(1, dtype='float64'), tf.norm(grad, ord=1)/C) for grad in grads]
+        else:
+            raise ValueError("Delta is {}, it cannot be negative!".format(DELTA))
+    return grads
+
+def CollectGradsVec(model, batch_size, datasets):
+    all_grads = []
+    for node in range(len(datasets)):
+        data_size = len(datasets[node][0])
+        if data_size <= batch_size:
+            batched_images = np.asarray(datasets[node][0])
+            batched_labels = np.asarray(datasets[node][1])
+        else:
+            candidate_indexes = np.random.choice(list(range(data_size)), batch_size, replace=False)
+            batched_images = np.asarray([datasets[node][0][index] for index in candidate_indexes])
+            batched_labels = np.asarray([datasets[node][1][index] for index in candidate_indexes])
+        batched_images = tf.convert_to_tensor(batched_images)
+        per_example_gradients = tf.vectorized_map(BatchedGrads, (batched_images, batched_labels))
+        all_grads.append([tf.reduce_sum(grad, axis = 0) for grad in per_example_gradients])
+    return all_grads
+
+def CollectGradsGoodFellow(model, batch_size, datasets):
+    all_grads = []
+    for node in range(len(datasets)):
+        data_size = len(datasets[node][0])
+        if data_size <= batch_size:
+            batched_images = np.asarray(datasets[node][0])
+            batched_labels = np.asarray(datasets[node][1])
+        else:
+            candidate_indexes = np.random.choice(list(range(data_size)), batch_size, replace=False)
+            batched_images = np.asarray([datasets[node][0][index] for index in candidate_indexes])
+            batched_labels = np.asarray([datasets[node][1][index] for index in candidate_indexes])
+        models = [model]*batch_size
+        with tf.GradientTape() as tape:
+            predictions = tf.stack([model(tf.reshape(image, [1, 60])) for model, image in zip(models, batched_images)])
+            targets = tf.one_hot(batched_labels, 10)
+            losses = tf.keras.losses.categorical_crossentropy(y_true=targets, y_pred=predictions)
+            batched_variables = [model.trainable_variables] * batch_size
+        batched_grads = tape.gradient(losses, batched_variables)
+        if CLIPPING:
+            if DELTA > 0:
+                batched_grads = [[grad / tf.maximum(tf.constant(1, dtype='float64'), tf.norm(grad)/C) for grad in grads] for grads in batched_grads]
+            elif DELTA == 0:
+                batched_grads = [[grad / tf.maximum(tf.constant(1, dtype='float64'), tf.norm(grad, ord=1)/C) for grad in grads] for grads in batched_grads]
+            else:
+                raise ValueError("Delta is {}, it cannot be negative!".format(DELTA))
+        sum_grads = CombinedGrads(batched_grads)
+        all_grads.append(sum_grads)
+    return all_grads
+
 def CollectGradsAdv(model, batch_size, datasets, C, clipping=False):
     all_grads = []
     for node in range(len(datasets)):
@@ -362,7 +426,7 @@ def CombinedGaussianGrad(all_grads, mean, std):
     
     return combined_grads
 
-def CombinedOriGrads(all_grads, avoid_zeros=False):
+def CombinedGrads(all_grads, avoid_zeros=False):
     combined_grads = []
     min_grad = FindMinGrad(all_grads)
     for grads in all_grads:
@@ -382,7 +446,7 @@ def SignGrads(grads):
 def CombinedGradientsWithPEstimation(all_grads, b, filter_zeros=False):
     
     sto_grads = CombinedStoGrads(all_grads, b)
-    ori_grads = CombinedOriGrads(all_grads)
+    ori_grads = CombinedGrads(all_grads)
     ori_grads = SignGrads(ori_grads)
     num_of_grads = NumOfGrads(sto_grads)
     zero_grads = 0
@@ -434,3 +498,32 @@ def EnableGPU():
         except RuntimeError as e:
             # Visible devices must be set before GPUs have been initialized
             print(e)
+
+NODES = 30
+tf.keras.backend.set_floatx('float64')
+LOSS_OBJECT = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+MODEL = keras.Sequential([keras.layers.Dense(1000, activation='relu', dtype='float64'),
+                          keras.layers.Dense(10, activation='softmax', dtype='float64')])
+C = tf.constant(3, dtype='float64')
+DELTA = 0
+CLIPPING = True
+
+train_dataset_by_node, test_dataset_by_node = AssignDatasets(NODES, min_labels = 2, number_of_imgs_by_node = 2000, have_same_label_number=True, pre_process=True, same_num_images_per_node=True, sample_overlap_data=False)
+batch_size = 512
+
+start_time = time.time()
+optimizer = SetOptimizer(0.0001)
+for epoch in range(11):
+    epoch_accuracy = tf.keras.metrics.SparseCategoricalAccuracy()
+    all_grads = CollectGradsVec(MODEL, batch_size, train_dataset_by_node)
+    combined_grads = CombinedGrads(all_grads)
+    optimizer.apply_gradients(zip(combined_grads, MODEL.trainable_variables))
+    accuracy = 0
+    for node in range(NODES):
+        accuracy += float(epoch_accuracy(np.asarray(train_dataset_by_node[node][1]), MODEL(np.asarray(train_dataset_by_node[node][0]))))
+    accuracy /= NODES
+    if epoch % 10 == 0:
+        print(epoch)
+        print(accuracy)
+end_time = time.time()
+print(end_time - start_time)
