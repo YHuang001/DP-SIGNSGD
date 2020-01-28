@@ -288,7 +288,7 @@ def BatchedGrads(args):
         inputs = tf.expand_dims(inputs, 0)
         targets = tf.one_hot(targets, 10, dtype='float64')
         predictions = MODEL(inputs)
-        loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=targets, logits=predictions))
+        loss = tf.reduce_mean(tf.keras.losses.categorical_crossentropy(y_true=targets, y_pred=predictions, from_logits=True))
 
     grads = tape.gradient(loss, MODEL.trainable_variables)
     if CLIPPING:
@@ -332,7 +332,7 @@ def CollectGradsGoodFellow(model, batch_size, datasets):
         with tf.GradientTape() as tape:
             predictions = tf.stack([model(tf.reshape(image, [1, 60])) for model, image in zip(models, batched_images)])
             targets = tf.one_hot(batched_labels, 10)
-            losses = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=targets, logits=predictions))
+            losses = tf.reduce_mean(tf.keras.losses.categorical_crossentropy(y_true=targets, y_pred=predictions, from_logits=True))
             batched_variables = [model.trainable_variables] * batch_size
         batched_grads = tape.gradient(losses, batched_variables)
         if CLIPPING:
