@@ -108,17 +108,13 @@ def AssignDatasets(nodes, min_labels = 1, number_of_imgs_by_node = 2000, have_sa
     mnist = keras.datasets.mnist
     (train_images, train_labels), (test_images, test_labels) = mnist.load_data()
     train_images, test_images = train_images/255.0, test_images/255.0
+    train_image_samples, test_image_samples = len(train_images), len(test_images)
+    original_shape = train_images[0].shape
+    flatten_shape = original_shape[0]*original_shape[1]
+    train_images_flatten, test_images_flatten = np.array(train_images).reshape((train_image_samples, flatten_shape)), np.array(test_images).reshape((test_image_samples, flatten_shape))
 
     if pre_process:
-        train_image_samples, test_image_samples = len(train_images), len(test_images)
-        original_shape = train_images[0].shape
-        flatten_shape = original_shape[0]*original_shape[1]
-        train_images_flatten, test_images_flatten = np.array(train_images).reshape((train_image_samples, flatten_shape)), np.array(test_images).reshape((test_image_samples, flatten_shape))
-        pca_dims = PCA()
-        pca_dims.fit(train_images_flatten)
-        cumsum = np.cumsum(pca_dims.explained_variance_ratio_)
-        d = np.argmax(cumsum>=0.95) + 1
-        pca = PCA(n_components=d)
+        pca = PCA(n_components=60)
         train_images, test_images = pca.fit_transform(train_images_flatten), pca.fit_transform(test_images_flatten)
 
     train_dataset = zip(train_images, train_labels)
@@ -281,25 +277,31 @@ def ClipGradsL2(grads, C):
     clipped_grads, _ = tf.clip_by_global_norm(grads, C)
     return clipped_grads
 
+def ClipGradsL1(grads, C):
+    norm_l1 = tf.add_n([tf.norm(grad, ord=1) for grad in grads])
+    clipped_grads,_ = tf.clip_by_global_norm(grads, C, use_norm=norm_l1)  
+    return clipped_grads
+
 def BatchedGrads(args):
     inputs, targets = args
     with tf.GradientTape() as tape:
         inputs = tf.expand_dims(inputs, 0)
         targets = tf.one_hot(targets, 10, dtype='float64')
         predictions = MODEL(inputs)
-        loss = tf.keras.losses.categorical_crossentropy(y_true=targets, y_pred=predictions)
+        loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=targets, logits=predictions))
 
     grads = tape.gradient(loss, MODEL.trainable_variables)
     if CLIPPING:
         if DELTA > 0:
-            return [grad / tf.maximum(tf.constant(1, dtype='float64'), tf.norm(grad)/C) for grad in grads]
+            global_norm = tf.math.sqrt(tf.add_n([tf.square(tf.norm(grad)) for grad in grads]))
         elif DELTA == 0:
-            return [grad / tf.maximum(tf.constant(1, dtype='float64'), tf.norm(grad, ord=1)/C) for grad in grads]
+            global_norm = tf.add_n([tf.norm(grad, ord=1) for grad in grads])
         else:
             raise ValueError("Delta is {}, it cannot be negative!".format(DELTA))
+        return [grad / tf.maximum(tf.constant(1, dtype='float64'), global_norm/C) for grad in grads]
     return grads
 
-def CollectGradsVec(model, batch_size, datasets):
+def CollectGradsVec(batch_size, datasets):
     all_grads = []
     for node in range(len(datasets)):
         data_size = len(datasets[node][0])
@@ -330,14 +332,14 @@ def CollectGradsGoodFellow(model, batch_size, datasets):
         with tf.GradientTape() as tape:
             predictions = tf.stack([model(tf.reshape(image, [1, 60])) for model, image in zip(models, batched_images)])
             targets = tf.one_hot(batched_labels, 10)
-            losses = tf.keras.losses.categorical_crossentropy(y_true=targets, y_pred=predictions)
+            losses = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=targets, logits=predictions))
             batched_variables = [model.trainable_variables] * batch_size
         batched_grads = tape.gradient(losses, batched_variables)
         if CLIPPING:
             if DELTA > 0:
-                batched_grads = [[grad / tf.maximum(tf.constant(1, dtype='float64'), tf.norm(grad)/C) for grad in grads] for grads in batched_grads]
+                batched_grads = [ClipGradsL2(grads, C) for grads in batched_grads]
             elif DELTA == 0:
-                batched_grads = [[grad / tf.maximum(tf.constant(1, dtype='float64'), tf.norm(grad, ord=1)/C) for grad in grads] for grads in batched_grads]
+                batched_grads = [ClipGradsL1(grads, C) for grads in batched_grads]
             else:
                 raise ValueError("Delta is {}, it cannot be negative!".format(DELTA))
         sum_grads = CombinedGrads(batched_grads)
@@ -515,7 +517,7 @@ start_time = time.time()
 optimizer = SetOptimizer(0.0001)
 for epoch in range(11):
     epoch_accuracy = tf.keras.metrics.SparseCategoricalAccuracy()
-    all_grads = CollectGradsVec(MODEL, batch_size, train_dataset_by_node)
+    all_grads = CollectGradsVec(batch_size, train_dataset_by_node)
     combined_grads = CombinedGrads(all_grads)
     optimizer.apply_gradients(zip(combined_grads, MODEL.trainable_variables))
     accuracy = 0
