@@ -66,7 +66,7 @@ def SameLabelSplitDataOverlap(nodes, images_by_label, labels_by_node, images_per
                 dataset_by_node[node][1] += labels
     return dataset_by_node
 
-def SameLabelSplitData(nodes, images_by_label, labels_by_node, number_of_imgs_by_node, same_num_images_per_node=False):
+def SameLabelSplitData(nodes, images_by_label, labels_by_node, label_mask, number_of_imgs_by_node, same_num_images_per_node=False):
     dataset_by_node = defaultdict(list)
     segments = math.ceil(nodes*labels_by_node/10)
     num_of_images_by_label = [len(images_by_label[label]) for label in range(10)]
@@ -77,15 +77,13 @@ def SameLabelSplitData(nodes, images_by_label, labels_by_node, number_of_imgs_by
         num_imgs_per_segment = [int(num_of_images/segments) for num_of_images in num_of_images_by_label]
     segment_ids = []
     heapq.heapify(segment_ids)
-    candidate_labels = list(range(10))
-    np.random.shuffle(candidate_labels)
     for label in range(10):
         heapq.heappush(segment_ids, (0, label))
     for node in range(nodes):
         used_labels = []
         for _ in range(labels_by_node):
             current_id, label = heapq.heappop(segment_ids)
-            actual_label = candidate_labels[label]
+            actual_label = label_mask[label]
             if same_num_images_per_node:
                 images_per_seg_per_label = num_imgs_per_segment
             else:
@@ -148,8 +146,10 @@ def AssignDatasets(nodes, min_labels = 1, number_of_imgs_by_node = 2000, have_sa
             train_dataset_by_node = SameLabelSplitDataOverlap(nodes, train_images_by_label, min_labels)
             test_dataset_by_node = SameLabelSplitDataOverlap(nodes, test_images_by_label, min_labels)
         else:
-            train_dataset_by_node = SameLabelSplitData(nodes, train_images_by_label, min_labels, number_of_imgs_by_node=number_of_imgs_by_node, same_num_images_per_node=same_num_images_per_node)
-            test_dataset_by_node = SameLabelSplitData(nodes, test_images_by_label, min_labels, number_of_imgs_by_node=number_of_imgs_by_node, same_num_images_per_node=same_num_images_per_node)
+            label_mask = np.arange(10)
+            np.random.shuffle(label_mask)
+            train_dataset_by_node = SameLabelSplitData(nodes, train_images_by_label, min_labels, label_mask = label_mask, number_of_imgs_by_node=number_of_imgs_by_node, same_num_images_per_node=same_num_images_per_node)
+            test_dataset_by_node = SameLabelSplitData(nodes, test_images_by_label, min_labels, label_mask = label_mask, number_of_imgs_by_node=number_of_imgs_by_node, same_num_images_per_node=same_num_images_per_node)
     else:
         for label in range(min_labels):
             if label == 0:
