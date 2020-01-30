@@ -109,11 +109,13 @@ def AssignDatasets(nodes, min_labels = 1, number_of_imgs_by_node = 2000, have_sa
     train_image_samples, test_image_samples = len(train_images), len(test_images)
     original_shape = train_images[0].shape
     flatten_shape = original_shape[0]*original_shape[1]
-    train_images_flatten, test_images_flatten = np.array(train_images).reshape((train_image_samples, flatten_shape)), np.array(test_images).reshape((test_image_samples, flatten_shape))
+    train_images, test_images = np.array(train_images).reshape((train_image_samples, flatten_shape)), np.array(test_images).reshape((test_image_samples, flatten_shape))
 
     if pre_process:
         pca = PCA(n_components=60)
-        train_images, test_images = pca.fit_transform(train_images_flatten), pca.fit_transform(test_images_flatten)
+        transformed_images = pca.fit_transform(np.concatenate(train_images, test_images))
+        train_images = transformed_images[:60000]
+        test_images = transformed_images[60000:]
 
     train_dataset = zip(train_images, train_labels)
     test_dataset = zip(test_images, test_labels)
@@ -510,12 +512,12 @@ C = tf.constant(3, dtype='float64')
 DELTA = 0
 CLIPPING = True
 
-train_dataset_by_node, test_dataset_by_node = AssignDatasets(NODES, min_labels = 2, number_of_imgs_by_node = 2000, have_same_label_number=True, pre_process=True, same_num_images_per_node=True, sample_overlap_data=False)
-batch_size = 512
-
+train_dataset_by_node, test_dataset_by_node = AssignDatasets(NODES, min_labels = 2, number_of_imgs_by_node = 2000, have_same_label_number=True, pre_process=False, same_num_images_per_node=True, sample_overlap_data=False)
+batch_size = 32
+# print(train_dataset_by_node[0][0][1].shape)
 start_time = time.time()
 optimizer = SetOptimizer(0.0001)
-for epoch in range(11):
+for epoch in range(1):
     epoch_accuracy = tf.keras.metrics.SparseCategoricalAccuracy()
     all_grads = CollectGradsVec(batch_size, train_dataset_by_node)
     combined_grads = CombinedGrads(all_grads)
