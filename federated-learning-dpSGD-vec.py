@@ -38,24 +38,10 @@ def SameLabelSplitData(nodes, images_by_label, labels_by_node, total_images_by_l
     return dataset_by_node
 
 # Assign datasets for all nodes from the MNIST dataset
-def AssignDatasets(nodes, min_labels, have_same_label_number=True, pre_process=False):
+def AssignDatasets(nodes, min_labels, have_same_label_number=True):
     mnist = keras.datasets.mnist
     (train_images, train_labels), (test_images, test_labels) = mnist.load_data()
     train_images, test_images = train_images/255.0, test_images/255.0
-
-    if pre_process:
-        train_image_samples, test_image_samples = len(train_images), len(test_images)
-        original_shape = train_images[0].shape
-        flatten_shape = original_shape[0]*original_shape[1]
-        train_images_flatten, test_images_flatten = np.array(train_images).reshape((train_image_samples, flatten_shape)), np.array(test_images).reshape((test_image_samples, flatten_shape))
-        pca_dims = PCA()
-        pca_dims.fit(train_images_flatten)
-        cumsum = np.cumsum(pca_dims.explained_variance_ratio_)
-        d = np.argmax(cumsum>=0.95) + 1
-        d = 60
-        pca = PCA(n_components=d)
-        pca.fit(train_images_flatten)
-        train_images, test_images = pca.transform(train_images_flatten), pca.transform(test_images_flatten)
 
     train_dataset = zip(train_images, train_labels)
     test_dataset = zip(test_images, test_labels)
