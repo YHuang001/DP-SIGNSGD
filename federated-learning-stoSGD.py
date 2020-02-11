@@ -1,4 +1,3 @@
-#!/gpfs_common/share03/hdai/richeng/Sim1/venv/bin/python3.6
 import tensorflow as tf
 from tensorflow import keras
 
@@ -12,37 +11,22 @@ from sklearn.decomposition import PCA
 from itertools import islice 
 import heapq
 
-
-# Split the whole dataset to datasets for all nodes in a way that two nodes can share some data and all nodes' datasets have the same number of distinct labels
-def SameLabelSplitDataOverlap(nodes, images_by_label, labels_by_node, images_per_node=2000, overlap=0.5):
+# Split the whole dataset to datasets for all nodes in a way that any two nodes do not share any data sample and all nodes' datasets have the same number of distinct labels
+def SameLabelSplitData(nodes, images_by_label, labels_by_node, total_images_by_label_with_reserve, num_imgs_per_label):
     dataset_by_node = defaultdict(list)
-    current_ids = [0]*10
-    candidate_pool = set(range(10))
-    prev_candidates = set([])
-    images_per_label = images_per_node // labels_by_node
+    candidate_pool = list(range(10))
+    current_img_ids = [0]*10
     for node in range(nodes):
-        if len(candidate_pool) <= labels_by_node:
-            first_candidates = list(candidate_pool)
-            remain_num_candidates = labels_by_node - len(candidate_pool)
-            second_candidates = list(np.random.choice(list(prev_candidates), remain_num_candidates, replace=False))
-            final_candidates = first_candidates + second_candidates
-            candidate_pool = prev_candidates.difference(set(second_candidates))
-            prev_candidates = set(final_candidates)
-        else:
-            final_candidates = list(np.random.choice(list(candidate_pool), labels_by_node, replace=False))
-            candidate_pool = candidate_pool.difference(set(final_candidates))
-            candidate_pool = candidate_pool.union(prev_candidates)
-            prev_candidates = set(final_candidates)
-        for label in final_candidates:
-            current_id = current_ids[label]
-            new_id = current_id + images_per_label
-            if new_id > len(images_by_label[label]):
-                end_id = new_id%len(images_by_label[label])
-                images = images_by_label[label][current_id : new_id] + images_by_label[label][:end_id] 
-                current_ids[label] = (current_id + int(overlap * images_per_label))%len(images_by_label[label])
-            else:
-                images = images_by_label[label][current_id : new_id]
-                current_ids[label] = (current_id + int(overlap * images_per_label))
+        chosen_labels = np.random.choice(candidate_pool, labels_by_node, replace=True)
+        for label in chosen_labels:
+            current_img_id = current_img_ids[label]
+            current_label_ceiling = total_images_by_label_with_reserve[label]
+            new_img_id = current_img_id + num_imgs_per_label
+            if current_img_id < current_label_ceiling and new_img_id >= current_label_ceiling:
+                new_img_id = current_label_ceiling
+            elif current_img_id >= current_label_ceiling:
+                new_img_id = current_img_id + 1
+            images = images_by_label[label][current_img_id : new_img_id]
             labels = [label]*len(images)
             if len(dataset_by_node[node]) == 0:
                 dataset_by_node[node].append(images)
@@ -50,49 +34,11 @@ def SameLabelSplitDataOverlap(nodes, images_by_label, labels_by_node, images_per
             else:
                 dataset_by_node[node][0] += images
                 dataset_by_node[node][1] += labels
-    return dataset_by_node
-
-# Split the whole dataset to datasets for all nodes in a way that any two nodes do not share any data sample and all nodes' datasets have the same number of distinct labels
-def SameLabelSplitData(nodes, images_by_label, labels_by_node, number_of_imgs_by_node, same_num_images_per_node=False):
-    dataset_by_node = defaultdict(list)
-    segments = math.ceil(nodes*labels_by_node/10)
-    num_of_images_by_label = [len(images_by_label[label]) for label in range(10)]
-    if same_num_images_per_node:
-        min_images_of_all_labels = min(num_of_images_by_label)
-        num_imgs_per_segment = min(int(min_images_of_all_labels/segments), number_of_imgs_by_node // labels_by_node)
-    else:
-        num_imgs_per_segment = [int(num_of_images/segments) for num_of_images in num_of_images_by_label]
-    segment_ids = []
-    heapq.heapify(segment_ids)
-    candidate_labels = list(range(10))
-    np.random.shuffle(candidate_labels)
-    for label in range(10):
-        heapq.heappush(segment_ids, (0, label))
-    for node in range(nodes):
-        used_labels = []
-        for _ in range(labels_by_node):
-            current_id, label = heapq.heappop(segment_ids)
-            actual_label = candidate_labels[label]
-            if same_num_images_per_node:
-                images_per_seg_per_label = num_imgs_per_segment
-            else:
-                images_per_seg_per_label = num_imgs_per_segment[actual_label]
-            images = images_by_label[actual_label][current_id*images_per_seg_per_label
-                                                   :(current_id+1)*images_per_seg_per_label]
-            labels = [actual_label]*len(images)
-            if len(dataset_by_node[node]) == 0:
-                dataset_by_node[node].append(images)
-                dataset_by_node[node].append(labels)
-            else:
-                dataset_by_node[node][0] += images
-                dataset_by_node[node][1] += labels
-            used_labels.append((current_id+1, label))
-        for used_label in used_labels:
-            heapq.heappush(segment_ids, used_label)
+            current_img_ids[label] = new_img_id
     return dataset_by_node
 
 # Assign datasets for all nodes from the MNIST dataset
-def AssignDatasets(nodes, min_labels, number_of_imgs_by_node = 2000, have_same_label_number=False, same_num_images_per_node=False, sample_overlap_data=False):
+def AssignDatasets(nodes, min_labels, have_same_label_number=True):
     mnist = keras.datasets.mnist
     (train_images, train_labels), (test_images, test_labels) = mnist.load_data()
     train_images, test_images = train_images/255.0, test_images/255.0
@@ -113,10 +59,9 @@ def AssignDatasets(nodes, min_labels, number_of_imgs_by_node = 2000, have_same_l
         train_images_by_label[train_labels[i]].append(image)
     for i, image in enumerate(test_images):
         test_images_by_label[test_labels[i]].append(image)
-
-    for label in range(10):
-        np.random.shuffle(train_images_by_label[label])
-        np.random.shuffle(test_images_by_label[label])
+    
+    total_train_images_by_label_with_reserve = [len(train_images_by_label[label]) - nodes for label in range(10)]
+    total_test_images_by_label_with_reserve = [len(test_images_by_label[label]) - nodes for label in range(10)]
     
     train_dataset_by_node = defaultdict(list)
     test_dataset_by_node =defaultdict(list)
@@ -124,12 +69,8 @@ def AssignDatasets(nodes, min_labels, number_of_imgs_by_node = 2000, have_same_l
     if min_labels > 10:
         raise ValueError("Minimum number of labels is {}, which exceeds the total number of labels!".format(min_labels))
     if have_same_label_number:
-        if sample_overlap_data:
-            train_dataset_by_node = SameLabelSplitDataOverlap(nodes, train_images_by_label, min_labels)
-            test_dataset_by_node = SameLabelSplitDataOverlap(nodes, test_images_by_label, min_labels)
-        else:
-            train_dataset_by_node = SameLabelSplitData(nodes, train_images_by_label, min_labels, number_of_imgs_by_node=number_of_imgs_by_node, same_num_images_per_node=same_num_images_per_node)
-            test_dataset_by_node = SameLabelSplitData(nodes, test_images_by_label, min_labels, number_of_imgs_by_node=number_of_imgs_by_node, same_num_images_per_node=same_num_images_per_node)
+        train_dataset_by_node = SameLabelSplitData(nodes, train_images_by_label, min_labels, total_train_images_by_label_with_reserve, num_train_images_per_label)
+        test_dataset_by_node = SameLabelSplitData(nodes, test_images_by_label, min_labels, total_test_images_by_label_with_reserve, num_test_images_per_label)
     else:
         for label in range(min_labels):
             if label == 0:
@@ -205,15 +146,6 @@ def ClipGradsL2(grads, C):
         print('global_norm larger than C')
     return clipped_grads
 
-# Clip the gradients with the global L1 norm
-def ClipGradsL1(grads, C):
-    norm_l1 = 0
-    for grad in grads:
-        norm_l1 += tf.norm(grad, ord=1)        
-    clipped_grads,_ = tf.clip_by_global_norm(grads,C,use_norm=norm_l1)  
-    print(norm_l1)
-    return clipped_grads
-
 # Collect gradients from all nodes
 def CollectGradsAdv(model, batch_size, datasets, C, delta, clipping):
     all_grads = []
@@ -235,10 +167,8 @@ def CollectGradsAdv(model, batch_size, datasets, C, delta, clipping):
                 _, grads = Grad(model, image, label)
                 if delta > 0:
                     grads = ClipGradsL2(grads, C)
-                elif delta == 0:
-                    grads = ClipGradsL1(grads, C)
                 else:
-                    raise ValueError("delta is {}, it cannot be negative!".format(delta))
+                    raise ValueError("delta is {}, it must be positive!".format(delta))
                     
                 if not batched_grads:
                     batched_grads = grads
@@ -334,9 +264,7 @@ if __name__ == '__main__':
     batch_size = 80000
     b = 0.1
     print("b is {}".format(b))
-    train_dataset_by_node, test_dataset_by_node = AssignDatasets(NODES, min_labels = num_labels_per_node,
-                                                                 number_of_imgs_by_node = 2000, have_same_label_number=True,
-                                                                 same_num_images_per_node=False, sample_overlap_data=False)
+    train_dataset_by_node, test_dataset_by_node = AssignDatasets(NODES,num_labels_per_node)    
     model = CreateModel((28, 28))
     optimizer = SetOptimizer(learning_rate)
     num_epoches = 101
