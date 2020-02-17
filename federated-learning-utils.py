@@ -436,32 +436,3 @@ def EnableGPU():
         except RuntimeError as e:
             # Visible devices must be set before GPUs have been initialized
             print(e)
-
-NODES = 30
-tf.keras.backend.set_floatx('float64')
-LOSS_OBJECT = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
-MODEL = keras.Sequential([keras.layers.Dense(1000, activation='relu', dtype='float64'),
-                          keras.layers.Dense(10, activation='softmax', dtype='float64')])
-C = tf.constant(3, dtype='float64')
-DELTA = 0
-CLIPPING = True
-
-train_dataset_by_node, test_dataset_by_node = AssignDatasets(NODES, min_labels = 2, number_of_imgs_by_node = 2000, have_same_label_number=True, pre_process=False, same_num_images_per_node=True, sample_overlap_data=False)
-batch_size = 32
-# print(train_dataset_by_node[0][0][1].shape)
-start_time = time.time()
-optimizer = SetOptimizer(0.0001)
-for epoch in range(1):
-    epoch_accuracy = tf.keras.metrics.SparseCategoricalAccuracy()
-    all_grads = CollectGradsVec(batch_size, train_dataset_by_node)
-    combined_grads = CombinedGrads(all_grads)
-    optimizer.apply_gradients(zip(combined_grads, MODEL.trainable_variables))
-    accuracy = 0
-    for node in range(NODES):
-        accuracy += float(epoch_accuracy(np.asarray(train_dataset_by_node[node][1]), MODEL(np.asarray(train_dataset_by_node[node][0]))))
-    accuracy /= NODES
-    if epoch % 10 == 0:
-        print(epoch)
-        print(accuracy)
-end_time = time.time()
-print(end_time - start_time)
