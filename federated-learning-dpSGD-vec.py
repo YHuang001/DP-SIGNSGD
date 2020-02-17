@@ -190,20 +190,21 @@ def ClipGradsL2(grads, C):
 
 # Compute the gradients for each data sample in a batch with clipping included
 def BatchedGrads(args):
-   inputs, targets = args
-   with tf.GradientTape() as tape:
-       inputs = tf.expand_dims(inputs, 0)
-       targets = tf.one_hot(targets, 10, dtype='float64')
-       predictions = MODEL(inputs)
-       loss = tf.keras.losses.categorical_crossentropy(y_true=targets, y_pred=predictions)
+    inputs, targets = args
+    with tf.GradientTape() as tape:
+        inputs = tf.expand_dims(inputs, 0)
+        targets = tf.one_hot(targets, 10, dtype='float64')
+        predictions = MODEL(inputs)
+        loss = tf.reduce_mean(tf.keras.losses.categorical_crossentropy(y_true=targets, y_pred=predictions, from_logits=True))
 
-   grads = tape.gradient(loss, MODEL.trainable_variables)
-   if CLIPPING:
-       if DELTA > 0:
-           return [grad / tf.maximum(tf.constant(1, dtype='float64'), tf.norm(grad)/C) for grad in grads]
-       else:
-           raise ValueError("Delta is {}, it must be positive!".format(DELTA))
-   return grads
+    grads = tape.gradient(loss, MODEL.trainable_variables)
+    if CLIPPING:
+        if DELTA > 0:
+            global_norm = tf.math.sqrt(tf.add_n([tf.square(tf.norm(grad)) for grad in grads]))
+        else:
+            raise ValueError("Delta is {}, it must be positive!".format(DELTA))
+        return [grad / tf.maximum(tf.constant(1, dtype='float64'), global_norm/C) for grad in grads]
+    return grads
 
 # Parallelly compute the gradients for a batch of samples with per-example clipping included.
 def CollectGradsVec(batch_size, datasets):
