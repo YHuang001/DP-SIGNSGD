@@ -8,9 +8,9 @@ from tensorflow import keras
 
 from collections import defaultdict
 import numpy as np
-import math
+import functools
 import heapq
-
+import math
 
 def SameLabelSplitDataReserve(
     nodes, imgs_by_label, labels_per_node,
@@ -102,7 +102,7 @@ def SameLabelSplitDataEven(
     np.random.shuffle(label_mask)
 
     # The mechanism is to store the unassigned segment id for all labels, assign the segment of the label with
-    # the smallest unassigned segment id (least assigned label).
+    # the smallest unassigned segment id (least assigned label), this is implemented using the heap.
     segment_ids = []
     heapq.heapify(segment_ids)
     for label in range(10):
@@ -136,7 +136,7 @@ def SameLabelSplitDataEven(
     return dataset_by_node
 
 def AssignDatasets(nodes, labels_per_node, use_even_split=False, has_same_num_imgs=False):
-    """Assign the training and testing datasets to all nodes.
+    """Assigns the training and testing datasets to all nodes.
 
     Args:
         nodes: Number of nodes to whom the splitted sub-datasets belong.
@@ -180,3 +180,320 @@ def AssignDatasets(nodes, labels_per_node, use_even_split=False, has_same_num_im
                                                       total_test_images_with_reserve_by_label)
     
     return train_dataset_by_node, test_dataset_by_node     
+
+
+# Model and gradient utility functions.
+def CreateModel(model_config):
+    """Creates a sequentail model given the model config.
+
+    Args:
+        model_config: model_config: The layer configuration including the layer size, activation type, and drop outs.
+    
+    Returns:
+        A sequential model.
+    """
+    base_model = [keras.layers.Flatten(input_shape=model_config['data_shape'])]
+    for layer in model_config['layers']:
+        if layer[0] == 'dropout':
+            base_model.append(keras.layers.Dropout(layer[1]))
+        else:
+            base_model.append(keras.layers.Dense(layer[0], activation=layer[1]))
+    return keras.Sequential(base_model)
+
+def SignGrads(grads):
+    """Finds the signs for the gradients computed.
+
+    Args:
+        grads: Input gradients.
+    
+    Returns:
+        Sign gradients correspond to the input gradients.
+    """
+    return [tf.sign[grad] for grad in grads]
+
+def Grad(model, loss_function, inputs, targets):
+    """Computes the model gradients.
+
+    Args:
+        model: The model for which the gradients are computed.
+        loss_function: The loss function used to compute the gradients.
+        inputs: The inputs for computing the gradients.
+        labels: The targets for computing the gradients.
+
+    Returns:
+        Model gradients.
+    """
+    with tf.GradientTape as tape:
+        loss_value = loss_function(y_true=targets, y_pred=model(inputs))
+    return tape.gradient(loss_value, model.trainable_variables)
+
+def CollectGradsVec(batch_size, datasets, model, enable_clipping, clipping_value):
+    """Collects all gradients with batch training, clipping function included.
+
+    Args:
+        batch_size: Batch size for the batch training.
+        datasets: Datasets for training.
+        model: Model to be trained.
+        enable_clipping: If set to true, clip the gradients to the clipping value.
+    
+    Returns:
+        All gradients for all nodes.
+    """
+    def BatchedGrads(args):
+        inputs, targets = args
+        with tf.GradientTape() as tape:
+            inputs = tf.expand_dims(inputs, 0)
+            targets = tf.one_hot(targets, 10)
+            predictions = model(inputs)
+            # This is essentially equivalent to tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+            # with an additional reduce mean step.
+            loss = tf.reduce_mean(tf.keras.losses.categorical_crossentropy(y_true=targets, y_pred=predictions, from_logits=True))
+
+        grads = tape.gradient(loss, model.trainable_variables)
+        if enable_clipping:
+            global_norm = tf.math.sqrt(tf.add_n([tf.square(tf.norm(grad)) for grad in grads]))
+            return [grad / tf.maximum(tf.constant(1), global_norm / clipping_value) for grad in grads]
+        return grads
+    
+    all_grads = []
+    for node in range(len(datasets)):
+       data_size = len(datasets[node][0])
+       if data_size <= batch_size:
+           batched_images = np.asarray(datasets[node][0])
+           batched_labels = np.asarray(datasets[node][1])
+       else:
+           candidate_indexes = np.random.choice(list(range(data_size)), batch_size, replace=False)
+           batched_images = np.asarray([datasets[node][0][index] for index in candidate_indexes])
+           batched_labels = np.asarray([datasets[node][1][index] for index in candidate_indexes])
+       batched_images = tf.convert_to_tensor(batched_images)
+       per_example_gradients = tf.vectorized_map(BatchedGrads, (batched_images, batched_labels))
+       all_grads.append([tf.reduce_sum(grad, axis = 0) for grad in per_example_gradients])
+    return all_grads        
+
+def CombineGrads(all_grads):
+    """Combines all gradients through summation without any transformation.
+
+    Args:
+        all_grads: Gradients of all model variables.
+    
+    Returns:
+        The combined gradients.
+    """
+    combined_grads = [functools.reduce(lambda a, b: a + b, [grad[layer] for grad in all_grads])
+                      for layer in range(len(all_grads[0]))]
+    
+    return combined_grads
+
+def SetHeteroB(all_grads):
+    """Sets the b values for each gradient element based on the maximum the absolute values of all gradients on this entry.
+
+    Args:
+        all_gradients: All gradients collected from all nodes.
+    
+    Returns:
+        Heterogeneous b values which has the same shape as the model gradients.
+    """
+    max_grads = [functools.reduce(lambda a, b: tf.maximum(tf.abs(a), tf.abs(b)), [grad[layer] for grad in all_grads])
+                 for layer in range(len(all_grads[0]))]
+
+    return max_grads
+
+def StoTransformation(grads, b_value, use_hetero_b):
+    """Performs the sto transformation on the gradients.
+
+    Args:
+        grads: Input gradients.
+        b_value: B values required for the sto transformation.
+        use_hetero_b: If set to true, use different b values for different entries in the gradients.
+    
+    Returns:
+        Gradients after the sto transformation.
+    """
+    lower_bound = 1e-20
+    transformed_grads = []
+    for i, grad in enumerate(grads):
+        random_tensor = tf.random.uniform(grad.shape, minval=0, maxval=1)
+        if use_hetero_b:
+            new_grad = grad / 2 * np.maximum(b_value[i], lower_bound) + 0.5
+        else:
+            new_grad = grad / 2 * np.maximum(b_value, lower_bound) + 0.5
+        compare_tensor = tf.math.less(random_tensor, new_grad)
+        transformed_grads.append(tf.sign(tf.dtypes.cast(compare_tensor, dtype="float64") - 0.5))
+    return transformed_grads
+
+def CombineStoGrads(all_grads, ori_grads_sign, b_value, num_of_byzantine, use_hetero_b, defend_strategy, defend_params):
+    """Combines all gradients through sto transformation and further applies the defend strategy.
+
+    Args:
+        all_grads: Gradients of all model variables.
+        ori_grads_sign: Gradients with each element being the sign of the combined gradients without any transformation.
+        b_value: B values for the sto transformation.
+        num_of_byzantine: Number of byzantine attackers. 
+        use_hetero_b: If set to true, use heterogeneous b values for sto transformation.
+        defend_strategy: The defend strategy applied. Currently, it can be the error feedback or the credit system.
+        defend_params: The defend parameters correspond to the defend strategy applied.
+    
+    Returns:
+        Final combined gradients and updated defend parameters.
+    """
+    # Reported grads from each node after the sto transformation and weights applied (if weights exist).
+    if 'credit_system' in defend_strategy:
+        credit_weights = defend_strategy['credit_weights']
+        if defend_params['weight_format'] == 'per_entry_weight':
+            sto_transformed_grads = [[StoTransformation(all_grads[node], b_value, use_hetero_b)[layer] * credit_weights[node][layer]
+                                      for layer in range(len(all_grads[node]))]
+                                     for node in range(len(all_grads))]
+        else:
+            sto_transformed_grads = [[StoTransformation(all_grads[node], b_value, use_hetero_b)[layer] * credit_weights[node]
+                                      for layer in range(len(all_grads[node]))]
+                                     for node in range(len(all_grads))]
+    else:
+        sto_transformed_grads = [StoTransformation(all_grads[j], b_value, use_hetero_b)
+                                 for j in range(len(all_grads))]
+    
+    combined_grads = CombineGrads(sto_transformed_grads)
+    if 'error_feedback' in defend_strategy:
+        error_grads = defend_strategy['error_grads']
+        for layer in range(len(combined_grads)):
+            combined_grads[layer] += -num_of_byzantine * ori_grads_sign[layer]
+            combined_grads[layer] /= (num_of_byzantine + len(all_grads))
+            combined_grads[layer] += error_grads[layer]
+    
+    final_grads = [tf.sign(grad) for grad in combined_grads]
+    total_grads = sum([functools.reduce(lambda a, b: a*b, list(grad.shape)) for grad in final_grads])
+    updated_defend_params = defend_params.copy()
+    
+    # Update defend parameters
+    if 'credit_system' in defend_strategy:
+        weight_decay = defend_params['weight_decay']
+        updated_credit_weights = []
+        for node in range(len(credit_weights)):
+            if defend_params['weight_format'] == 'per_entry_weight':
+                # If the sign of the reported gradient entry is equal to the corresponding entry in the final grads,
+                # the corresponding weight is 1. Otherwise, it is set to -1.
+                new_credit_weights = [
+                    (tf.sign(tf.dtypes.cast(tf.equal(sto_transformed_grads[node][layer], final_grads[layer]), dtypes='float64') - 0.5)
+                     + credit_weights[node][layer] * weight_decay)
+                    for layer in range(len(final_grads))]
+            else:
+                num_of_equal_grads = sum([
+                    tf.reduce_sum(tf.sign(tf.dtypes.cast(tf.equal(sto_transformed_grads[node][layer], final_grads[layer]), dtypes='float64') - 0.5))
+                    for layer in range(len(final_grads))
+                ])
+                new_credit_weights = credit_weights[node] * weight_decay + num_of_equal_grads / total_grads
+            updated_credit_weights.append(new_credit_weights)
+        updated_defend_params['credit_weights'] = updated_credit_weights
+    
+    if 'error_feedback' in defend_strategy:
+        updated_defend_params['error_grads'] = [combined_grads[layer] - (num_of_byzantine + len(all_grads)) * sto_transformed_grads[layer]
+                                                for layer in range(len(final_grads))]
+    return sto_transformed_grads, updated_defend_params
+
+def CombineStoGradientsWithPEstimation(all_grads, b_value, use_hetero_b, num_of_byzantine, defend_strategy, defend_params):
+    """Combines all gradients using the sto transformation and estimates the portion of sign gradients no equal to the sign of the true gradients.
+
+    Args:
+        all_grads: Gradients of all model variables.
+        b_value: B values for the sto transformation.
+        use_hetero_b: If set to true, use heterogeneous b values for sto transformation.
+        num_of_byzantine: Number of byzantine attackers.
+        defend_strategy: The defend strategy applied in sto transformation.
+            Currently, it can be the error feedback or the credit system.
+        defend_params: The defend parameters correspond to the defend strategy applied in sto transformation.
+
+    Returns:
+        Portion of gradients with different signs compared to the true gradients, gradients after sto transformation,
+        and error gradients.
+    """
+    ori_grads = CombineGrads(all_grads)
+    ori_grads_sign = SignGrads(ori_grads)
+    sto_transformed_grads, updated_defend_params = CombineStoGrads(all_grads, ori_grads_sign, b_value,
+                                                                   num_of_byzantine, use_hetero_b,
+                                                                   defend_strategy, defend_params)
+    total_grads = sum([functools.reduce(lambda a, b: a*b, list(grad.shape)) for grad in sto_transformed_grads])
+    non_equal_grads = 0
+    for i in range(len(sto_transformed_grads)):
+        non_equal_grads += tf.math.reduce_sum(tf.dtypes.cast(tf.math.not_equal(sto_transformed_grads[i], ori_grads_sign[i]), dtype="float64"))
+    
+    return non_equal_grads / total_grads, sto_transformed_grads, updated_defend_params
+
+# Models used for training and testing.
+class FederatedModel(object):
+    """A sequential model with dense layers used for ferderated learning."""
+    def __init__(self, model_config, loss_function, learning_rate,
+                 train_datasets, test_datasets, adv_parameters):
+        """Initializes model with the necessary components.
+
+        Args:
+            model_config: The layer configuration including the layer size, activation type, and drop outs. This should
+                be a dictionary.
+                For example, model_configs = {
+                    'data_shape' : (28, 28),
+                    'layers': [(512, 'relu'), ('dropout', 0.2), (10, 'softmax')]}.
+            loss_function: The loss function used to compute the loss.
+            learning_rate: The learning rate for training the model.
+            train_datasets: Datasets used for training the model.
+            test_datasets: Datasets used for testing the model.
+            adv_parameters: Additional parameters used for advanced features like STO transformation and gradient clipping.
+                This should be a dictionary.
+                For example, adv_parameters = {
+                    'clipping_value': 4,
+                    'enable_clipping': True,
+                    'batch_size': 100
+                    ...
+                }
+        """
+        self._model = CreateModel(model_config)
+        self._loss_function = loss_function
+        self._optimizer = tf.keras.optimizers.SGD(learning_rate=learning_rate)
+        self._train_datasets = train_datasets
+        self._test_datasets = test_datasets
+        self._adv_parameters = adv_parameters
+
+    def OneEpochTrainingStoVec(self):
+        """Trains the model with clipping options and sto transformation using the vectorized mapping."""
+        batch_size = self._adv_parameters['batch_size']
+        clipping_value, enable_clipping = self._adv_parameters['clipping_value'], self._adv_parameters['enable_clipping']
+        datasets = self._train_datasets
+        nodes = len(datasets)
+        model = self._model
+        use_hetero_b = self._adv_parameters['use_hetero_b']
+        num_of_byzantine = self._adv_parameters['num_of_byzantine']
+        defend_strategy = self._adv_parameters['defend_strategy']
+        all_grads = CollectGradsVec(batch_size, datasets, model, enable_clipping, clipping_value)
+
+        if use_hetero_b:
+            b_value = SetHeteroB(all_grads)
+        else:
+            b_value = self._adv_parameters['b_value']
+
+        # Initialize the defend parameters like error gradients and credit weights.
+        defend_params = {}
+        # Initial error gradients should be all zeros by default.
+        if 'error_feedback' in defend_strategy:
+            defend_params['error_grads'] = self._adv_parameters['defend_params'].get(
+                'error_grads',
+                [tf.zeros(model.trainable_variables[layer.shape]) for layer in range(len(model.trainable_variables))]
+            )
+        # Initial credit weights should be all ones by default.
+        if 'credit_system' in defend_strategy:
+            defend_params['credit_weights'] = self._adv_parameters['defend_params'].get(
+                'credit_weights',
+                [tf.ones(model.trainable_variables[layer.shape]) for layer in range(len(model.trainable_variables))]
+            )
+            # weight_format should have two types: per_entry_weight and per_node_weight.
+            defend_params['weigh_format'] = self._adv_parameters['defend_params'].get(
+                'weight_format',
+                'per_entry_weight'
+            )
+            defend_params['weight_decay'] = self._adv_parameters['defend_params'].get(
+                'weight_decay', 0.5
+            )
+            
+        p_z, sto_transformed_grads, self._adv_parameters['defend_params'] = CombineStoGradientsWithPEstimation(
+            all_grads, b_value, use_hetero_b, num_of_byzantine, defend_strategy, defend_params)
+        self._optimizer.apply_gradients(zip(sto_transformed_grads, model.trainable_variables))
+        epoch_accuracy = tf.keras.metrics.SparseCategoricalAccuracy()
+        accuracy = sum([float(epoch_accuracy(np.asarray(datasets[node][1]),
+                                             model(np.asarray(datasets[node][0])))) for node in range(nodes)]) / nodes
+        return p_z, accuracy
