@@ -367,18 +367,20 @@ def CombineStoGrads(all_grads, ori_grads_sign, b_value, attack_strategy, defend_
     normal_nodes = len(all_grads)
     use_per_entry_weight = isinstance(credit_weights[0], list)
     reported_transformed_grads = []
+    weighted_transformed_grads = []
     for node, grads in enumerate(all_grads):
         current_sto_transformed_grads = StoTransformation(grads, b_value)
+        reported_transformed_grads.append(current_sto_transformed_grads)
         if use_per_entry_weight:
             weighted_grads = [current_sto_transformed_grads[layer] * credit_weights[node][layer]
                               for layer in range(len(grads))]
         else:
             weighted_grads = [current_sto_transformed_grads[layer] * credit_weights[node]
                               for layer in range(len(grads))]
-        reported_transformed_grads.append(weighted_grads)
+        weighted_transformed_grads.append(weighted_grads)
     
     # Report grads from attackers based on their attack mode.
-    combined_grads = CombineGrads(reported_transformed_grads)
+    combined_grads = CombineGrads(weighted_transformed_grads)
     num_of_byzantines = attack_strategy['num_of_byzantines']
     attack_mode = attack_strategy['attack_mode']
     for byzantine_id in range(num_of_byzantines):
@@ -391,10 +393,10 @@ def CombineStoGrads(all_grads, ori_grads_sign, b_value, attack_strategy, defend_
                 attack_grads = tf.sign(tf.random.uniform(ori_grads_sign[layer].shape, minval=-1.0, maxval=1.0, dtype='float64'))
             else:
                 raise TypeError(f'{attack_mode} is not supported!')
-            weights = credit_weights[current_node][layer] if use_per_entry_weight else credit_weights[current_node]
-            attack_grads = attack_grads * weights
-            combined_grads[layer] += attack_grads
             attacker_full_grads.append(attack_grads)
+            weights = credit_weights[current_node][layer] if use_per_entry_weight else credit_weights[current_node]
+            weighted_attack_grads = attack_grads * weights
+            combined_grads[layer] += weighted_attack_grads
         reported_transformed_grads.append(attacker_full_grads)
     
     # Final grads processing.
