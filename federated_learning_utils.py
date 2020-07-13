@@ -12,6 +12,7 @@ import functools
 import heapq
 import math
 
+
 def SameLabelSplitDataReserve(
     nodes, imgs_by_label, labels_per_node,
     num_imgs_per_node, total_images_with_reserve_by_label):
@@ -307,10 +308,7 @@ def CombineGrads(all_grads):
     Returns:
         The combined gradients.
     """
-    combined_grads = [functools.reduce(lambda a, b: a + b, [grad[layer] for grad in all_grads])
-                      for layer in range(len(all_grads[0]))]
-    
-    return combined_grads
+    return [sum(grad[layer] for grad in all_grads) for layer in range(len(all_grads[0]))]
 
 def SetHeteroB(all_grads):
     """Sets the b values for each gradient element based on the maximum the absolute values of all gradients on this entry.
@@ -400,10 +398,10 @@ def CombineStoGrads(all_grads, ori_grads_sign, b_value, attack_strategy, defend_
         reported_transformed_grads.append(attacker_full_grads)
     
     # Final grads processing.
+    error_grads = defend_params['error_grads']
     total_nodes = num_of_byzantines + normal_nodes
     for layer in range(len(combined_grads)):
         combined_grads[layer] /= total_nodes
-        error_grads = defend_params['error_grads']
         combined_grads[layer] += error_grads[layer]
     
     final_grads = [tf.sign(grad) for grad in combined_grads]
@@ -496,6 +494,14 @@ class FederatedModel(object):
         self._adv_parameters = adv_parameters
         self._use_vec_training = self._adv_parameters['use_vec_training']
         self._optimizer = tf.keras.optimizers.SGD(learning_rate=self._adv_parameters['learning_rate'])
+        self._defend_params = adv_parameters['defend_params']
+        total_nodes = self._nodes + self._adv_parameters['attack_strategy']['num_of_byzantines']
+        if 'error_grads' not in self._defend_params:
+            self._defend_params['error_grads'] = [tf.zeros(model_layer.shape, dtype='float64')
+                                                  for model_layer in self._model.trainable_variables]
+        if 'credit_weights' not in self._defend_params:
+            self._defend_params['credit_weights'] = [[tf.ones(self._model.trainable_variables[layer].shape, dtype='float64') for layer in range(len(self._model.trainable_variables))]
+                                                      for node in range(total_nodes)]
 
     def OneEpochTrainingSto(self):
         """Trains the model with clipping options and sto transformation using the vectorized mapping."""
@@ -508,13 +514,7 @@ class FederatedModel(object):
         
         attack_strategy = self._adv_parameters['attack_strategy']
         defend_strategy = self._adv_parameters['defend_strategy']
-        defend_params = self._adv_parameters['defend_params']
-        if 'error_grads' not in defend_params:
-            defend_params['error_grads'] = [tf.zeros(model_layer.shape, dtype='float64')
-                                            for model_layer in model.trainable_variables]
-        if 'credit_weights' not in defend_params:
-            defend_params['credit_weights'] = [[tf.ones(model.trainable_variables[layer].shape, dtype='float64') for layer in range(len(model.trainable_variables))]
-                                               for node in range(nodes + attack_strategy['num_of_byzantines'])]
+
         if self._use_vec_training:
             all_grads = CollectGradsVec(datasets, model, batch_size, enable_clipping, clipping_value)
         else:
@@ -523,9 +523,8 @@ class FederatedModel(object):
             'b_value',
             SetHeteroB(all_grads)
         )
-            
-        p_z, sto_transformed_grads, self._adv_parameters['defend_params'] = CombineStoGradientsWithPEstimation(
-            all_grads, b_value, attack_strategy, defend_strategy, defend_params)
+        p_z, sto_transformed_grads, self._defend_params = CombineStoGradientsWithPEstimation(
+            all_grads, b_value, attack_strategy, defend_strategy, self._defend_params)
         self._optimizer.apply_gradients(zip(sto_transformed_grads, model.trainable_variables))
         epoch_accuracy = tf.keras.metrics.SparseCategoricalAccuracy()
         accuracy = sum([float(epoch_accuracy(np.asarray(datasets[node][1]),
