@@ -346,22 +346,23 @@ def StoTransformation(grads, b_value):
         transformed_grads.append(tf.sign(tf.dtypes.cast(compare_tensor, dtype='float64') - 0.5))
     return transformed_grads
 
-def CombineStoGrads(all_grads, ori_grads_sign, b_value, attack_strategy, defend_strategy, defend_params):
-    """Combines all gradients through sto transformation and further applies the defend strategy.
+def CombineStoGrads(all_grads, ori_grads_sign, b_value, attack_strategy, enable_credit, enable_error_feedback, feedback_params):
+    """Combines all gradients through sto transformation and further applies the error feedback or credit system.
 
     Args:
         all_grads: Gradients of all model variables.
         ori_grads_sign: Gradients with each element being the sign of the combined gradients without any transformation.
         b_value: B values for the sto transformation.
         attack_strategy: Attack strategies adopted by the attacker, including the number of byzantine attackers and the attack mode.
-        defend_strategy: The defend strategy applied. Currently, it can be the error feedback or the credit system.
-        defend_params: The defend parameters correspond to the defend strategy applied.
+        enable_credit: If set to true, enable the credit system.
+        enable_error_feedback: If set to true, enable the error feedback mechanism.
+        feedback_params: All parameters that are looped during the training, e.g., credit weights and error gradients.
     
     Returns:
-        Final combined gradients and updated defend parameters.
+        Final combined gradients and updated feedback parameters.
     """
     # Report grads from each node after the sto transformation and weights applied (if weights exist).
-    credit_weights = defend_params['credit_weights']
+    credit_weights = feedback_params['credit_weights']
     normal_nodes = len(all_grads)
     use_per_entry_weight = isinstance(credit_weights[0], list)
     reported_transformed_grads = []
@@ -398,7 +399,7 @@ def CombineStoGrads(all_grads, ori_grads_sign, b_value, attack_strategy, defend_
         reported_transformed_grads.append(attacker_full_grads)
     
     # Final grads processing.
-    error_grads = defend_params['error_grads']
+    error_grads = feedback_params['error_grads']
     total_nodes = num_of_byzantines + normal_nodes
     for layer in range(len(combined_grads)):
         combined_grads[layer] /= total_nodes
@@ -406,15 +407,19 @@ def CombineStoGrads(all_grads, ori_grads_sign, b_value, attack_strategy, defend_
     
     final_grads = [tf.sign(grad) for grad in combined_grads]
     total_grads = sum([functools.reduce(lambda a, b: a*b, list(grad.shape)) for grad in final_grads])
-    updated_defend_params = defend_params.copy()
+    updated_feedback_params = {}
+    updated_feedback_params['weight_decay'] = feedback_params['weight_decay']
     
-    # Update defend parameters
-    if 'error_feedback' in defend_strategy:
-        updated_defend_params['error_grads'] = [combined_grads[layer] - final_grads[layer] / total_nodes
+    # Update feedback parameters
+    if enable_error_feedback:
+        updated_feedback_params['error_grads'] = [combined_grads[layer] - final_grads[layer] / total_nodes
                                                 for layer in range(len(final_grads))]
-    if 'credit_system' in defend_strategy:
-        weight_decay = defend_params['weight_decay']
-        # updated_normalization_value = weight_decay * defend_params['normalization_value'] + 1.0
+    else:
+        updated_feedback_params['error_grads'] = error_grads
+
+    if enable_credit:
+        weight_decay = feedback_params['weight_decay']
+        # updated_normalization_value = weight_decay * feedback_params['normalization_value'] + 1.0
         updated_credit_weights = []
         for node in range(total_nodes):
             if use_per_entry_weight:
@@ -431,19 +436,22 @@ def CombineStoGrads(all_grads, ori_grads_sign, b_value, attack_strategy, defend_
                 ])
                 new_credit_weights = credit_weights[node] * weight_decay + num_of_equal_grads / total_grads
             updated_credit_weights.append(new_credit_weights)
-        updated_defend_params['credit_weights'] = updated_credit_weights
-    return final_grads, updated_defend_params
+        updated_feedback_params['credit_weights'] = updated_credit_weights
+    else:
+        updated_feedback_params['credit_weights'] = feedback_params['credit_weights']
 
-def CombineStoGradientsWithPEstimation(all_grads, b_value, attack_strategy, defend_strategy, defend_params):
+    return final_grads, updated_feedback_params
+
+def CombineStoGradientsWithPEstimation(all_grads, b_value, attack_strategy, enable_credit, enable_error_feedback, feedback_params):
     """Combines all gradients using the sto transformation and estimates the portion of sign gradients no equal to the sign of the true gradients.
 
     Args:
         all_grads: Gradients of all model variables.
         b_value: B values for the sto transformation.
         attack_strategy: Attack strategies adopted by the attacker, including the number of byzantine attackers and the attack mode.
-        defend_strategy: The defend strategy applied in sto transformation.
-            Currently, it can be the error feedback or the credit system.
-        defend_params: The defend parameters correspond to the defend strategy applied in sto transformation.
+        enable_credit: If set to true, enable the credit system.
+        enable_error_feedback: If set to true, enable the error feedback mechanism.
+        feedback_params: All parameters that are looped during the training, e.g., credit weights and error gradients.
 
     Returns:
         Portion of gradients with different signs compared to the true gradients, gradients after sto transformation,
@@ -451,14 +459,14 @@ def CombineStoGradientsWithPEstimation(all_grads, b_value, attack_strategy, defe
     """
     ori_grads = CombineGrads(all_grads)
     ori_grads_sign = SignGrads(ori_grads)
-    sto_transformed_grads, updated_defend_params = CombineStoGrads(all_grads, ori_grads_sign, b_value, attack_strategy,
-                                                                   defend_strategy, defend_params)
+    sto_transformed_grads, updated_feedback_params = CombineStoGrads(all_grads, ori_grads_sign, b_value, attack_strategy,
+                                                                     enable_credit, enable_error_feedback, feedback_params)
     total_grads = sum([functools.reduce(lambda a, b: a*b, list(grad.shape)) for grad in sto_transformed_grads])
     non_equal_grads = 0
     for i in range(len(sto_transformed_grads)):
         non_equal_grads += tf.math.reduce_sum(tf.dtypes.cast(tf.math.not_equal(sto_transformed_grads[i], ori_grads_sign[i]), dtype="float64"))
     
-    return non_equal_grads / total_grads, sto_transformed_grads, updated_defend_params
+    return non_equal_grads / total_grads, sto_transformed_grads, updated_feedback_params
 
 # Models used for training and testing.
 class FederatedModel(object):
@@ -492,28 +500,32 @@ class FederatedModel(object):
         self._nodes = len(self._train_datasets)
         self._test_datasets = test_datasets
         self._adv_parameters = adv_parameters
+        self._training_epochs = 0
         self._use_vec_training = self._adv_parameters['use_vec_training']
         self._optimizer = tf.keras.optimizers.SGD(learning_rate=self._adv_parameters['learning_rate'])
-        self._defend_params = adv_parameters['defend_params']
+        self._feedback_params = adv_parameters['feedback_params']
         total_nodes = self._nodes + self._adv_parameters['attack_strategy']['num_of_byzantines']
-        if 'error_grads' not in self._defend_params:
-            self._defend_params['error_grads'] = [tf.zeros(model_layer.shape, dtype='float64')
-                                                  for model_layer in self._model.trainable_variables]
-        if 'credit_weights' not in self._defend_params:
-            self._defend_params['credit_weights'] = [[tf.ones(self._model.trainable_variables[layer].shape, dtype='float64') for layer in range(len(self._model.trainable_variables))]
-                                                      for node in range(total_nodes)]
+        if 'error_grads' not in self._feedback_params:
+            self._feedback_params['error_grads'] = [tf.zeros(model_layer.shape, dtype='float64')
+                                                    for model_layer in self._model.trainable_variables]
+        if 'credit_weights' not in self._feedback_params:
+            self._feedback_params['credit_weights'] = [[tf.ones(self._model.trainable_variables[layer].shape, dtype='float64') for layer in range(len(self._model.trainable_variables))]
+                                                       for node in range(total_nodes)]
 
     def OneEpochTrainingSto(self):
         """Trains the model with clipping options and sto transformation using the vectorized mapping."""
         batch_size = self._adv_parameters['batch_size']
         loss_function = self._adv_parameters['loss_function']
         clipping_value, enable_clipping = self._adv_parameters['clipping_value'], self._adv_parameters['enable_clipping']
+        enable_credit = self._adv_parameters['enable_credit']
+        if 'turn_off_credit_after_rounds' in self._adv_parameters and self._training_epochs >= self._adv_parameters['turn_off_credit_after_rounds']:
+            enable_credit = False            
+        enable_error_feedback = self._adv_parameters['enable_error_feedback']
         datasets = self._train_datasets
         nodes = self._nodes
         model = self._model
         
         attack_strategy = self._adv_parameters['attack_strategy']
-        defend_strategy = self._adv_parameters['defend_strategy']
 
         if self._use_vec_training:
             all_grads = CollectGradsVec(datasets, model, batch_size, enable_clipping, clipping_value)
@@ -523,12 +535,13 @@ class FederatedModel(object):
             'b_value',
             SetHeteroB(all_grads)
         )
-        p_z, sto_transformed_grads, self._defend_params = CombineStoGradientsWithPEstimation(
-            all_grads, b_value, attack_strategy, defend_strategy, self._defend_params)
+        p_z, sto_transformed_grads, self._feedback_params = CombineStoGradientsWithPEstimation(
+            all_grads, b_value, attack_strategy, enable_credit, enable_error_feedback, self._feedback_params)
         self._optimizer.apply_gradients(zip(sto_transformed_grads, model.trainable_variables))
         epoch_accuracy = tf.keras.metrics.SparseCategoricalAccuracy()
         accuracy = sum([float(epoch_accuracy(np.asarray(datasets[node][1]),
                                              model(np.asarray(datasets[node][0])))) for node in range(nodes)]) / nodes
+        self._training_epochs += 1
         return p_z, accuracy
     
     def TestAccuracy(self):

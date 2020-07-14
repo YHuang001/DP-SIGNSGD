@@ -6,7 +6,7 @@ import tensorflow as tf
 
 # Input parameters
 tf.keras.backend.set_floatx('float64')
-training_epochs = 51
+training_epochs = 14
 number_of_nodes = 31
 number_of_byzantines = 3
 labels_per_node = 1
@@ -20,8 +20,7 @@ attack_strategy = {
     'num_of_byzantines': number_of_byzantines,
     'attack_mode': 'best'
 }
-defend_strategy = ()
-defend_params = {
+feedback_params = {
     # 'credit_weights': [tf.constant(1.0, dtype='float64') for node in range(number_of_nodes + number_of_byzantines)],
     'weight_decay': 0.6,
 }
@@ -33,8 +32,11 @@ adv_parameters = {
     'clipping_value': 4,
     'enable_clipping': False,
     'attack_strategy': attack_strategy,
-    'defend_strategy': defend_strategy,
-    'defend_params': defend_params
+    'enable_credit': False,
+    # Credit weight update is disabled after this value of training epoches.
+    'turn_off_credit_after_rounds': 10,
+    'enable_error_feedback': True,
+    'feedback_params': feedback_params
 }
 
 # Simulation Part
@@ -52,25 +54,26 @@ print(federated_model.TestAccuracy())
 # ############################################################### 
 # model = fl_utils.CreateModel(model_configs)
 # attack_strategy = adv_parameters['attack_strategy']
-# defend_strategy = adv_parameters['defend_strategy']
-# defend_params = adv_parameters['defend_params']
+# feedback_params = adv_parameters['feedback_params']
 # loss_function = adv_parameters['loss_function']
 # batch_size = adv_parameters['batch_size']
 # optimizer = tf.keras.optimizers.SGD(learning_rate=adv_parameters['learning_rate'])
-# error_grads = [tf.zeros(model_layer.shape, dtype='float64') for model_layer in model.trainable_variables]
-# if 'error_grads' not in defend_params:
-#     defend_params['error_grads'] = [tf.zeros(model_layer.shape, dtype='float64')
-#                                     for model_layer in model.trainable_variables]
-# if 'credit_weights' not in defend_params:
-#     defend_params['credit_weights'] = [[tf.ones(model.trainable_variables[layer].shape, dtype='float64') for layer in range(len(model.trainable_variables))]
-#                                         for node in range(number_of_nodes + attack_strategy['num_of_byzantines'])]
-
+# if 'error_grads' not in feedback_params:
+#     feedback_params['error_grads'] = [tf.zeros(model_layer.shape, dtype='float64')
+#                                       for model_layer in model.trainable_variables]
+# if 'credit_weights' not in feedback_params:
+#     feedback_params['credit_weights'] = [[tf.ones(model.trainable_variables[layer].shape, dtype='float64') for layer in range(len(model.trainable_variables))]
+#                                          for node in range(number_of_nodes + attack_strategy['num_of_byzantines'])]
+# enable_credit = adv_parameters['enable_credit']
+# enable_error_feedback = adv_parameters['enable_error_feedback']
 
 # for epoch in range(training_epochs):
+#     if 'turn_off_credit_after_rounds' in adv_parameters and epoch >= adv_parameters['turn_off_credit_after_rounds']:
+#         enable_credit = False
 #     all_grads = fl_utils.CollectGradsNormal(train_datasets, model, batch_size, loss_function)
 #     b_value = fl_utils.SetHeteroB(all_grads)
-#     p_z, sto_transformed_grads, defend_params = fl_utils.CombineStoGradientsWithPEstimation(
-#         all_grads, b_value, attack_strategy, defend_strategy, defend_params
+#     p_z, sto_transformed_grads, feedback_params = fl_utils.CombineStoGradientsWithPEstimation(
+#         all_grads, b_value, attack_strategy, enable_credit, enable_error_feedback, feedback_params
 #     )
 #     optimizer.apply_gradients(zip(sto_transformed_grads, model.trainable_variables))
 #     epoch_accuracy = tf.keras.metrics.SparseCategoricalAccuracy()
